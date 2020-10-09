@@ -10,6 +10,7 @@ from collections import namedtuple
 from collections import defaultdict
 from interruptingcow import timeout
 from dataclasses import dataclass
+from scipy.special import softmax
 
 import cython
 if cython.compiled:
@@ -106,6 +107,7 @@ class TreeNode:
         self.numerator = 0.0
         self.denominator = 0.0
         self.flag = 0.0
+        self.gg = False
 
     def payout(self):
         return self.numerator / float(self.denominator)
@@ -138,13 +140,23 @@ class AbstractMctsAgent(Agent):
         for t in range(num_steps):
             print(t)
             # 1. select node to expand
+            current_time = time.time()
             selected_node = self.select_node(root)
+            print("\t" + str(time.time() - current_time))
+            current_time = time.time()
             # 2. look at children of selected node and choose one
             expanding_child = self.expand(selected_node)
-            # 3. play a full random game from selected node
-            result = self.play_game(expanding_child)
-            # 4. backprop result
-            self.backprop(expanding_child, result)
+            print("\t" + str(time.time() - current_time))
+            current_time = time.time()
+            if expanding_child:
+                # 3. play a full random game from selected node
+                result = self.play_game(expanding_child)
+                print("\t" + str(time.time() - current_time))
+                current_time = time.time()
+                # 4. backprop result
+                self.backprop(expanding_child, result)
+                print("\t" + str(time.time() - current_time))
+                current_time = time.time()
         
         best_child = max(root.children, key=lambda x: x.payout())
         return best_child.payout(), best_child.move
@@ -177,7 +189,7 @@ class AbstractMctsAgent(Agent):
 
     def get_move(self):
         #best_value, best_move = self.alphabeta(depth=4)
-        best_value, best_move = self.mcts(num_steps=100)
+        best_value, best_move = self.mcts(num_steps=10)
         print(str(best_move) + ":\t" + str(best_value))
         return best_move.uci()
 
@@ -185,55 +197,78 @@ class AbstractMctsAgent(Agent):
 class DumbMctsAgent(AbstractMctsAgent):
     def select_node(self, root):
         selected_node = root
-        blah = 0
         while len(selected_node.children) > 0:
-            '''
-            print("loop start")
-            print(selected_node)
-            print(selected_node.position)
-            print(selected_node.children)
-            '''
-            selected_node = random.choice(selected_node.children)
-            '''
-            print(selected_node)
-            print(selected_node.position)
-            print("loop end")
-            blah += 1
-            if blah > 5:
-                sys.exit(0)
-            '''
+            random_selection = random.choice(selected_node.children)
+            selected_node = random_selection
         return selected_node
 
-    def expand(self, node):
-        board = PxBoard(node.position)
-        chosen_move = random.choice(list(board.legal_moves))
         '''
-        print("EXPAND FUNCTION")
-        print(node.position)
-        print(board.fen())
+        selected_node_stack = [root]
+        while len(selected_node_stack[-1].children) > 0:
+            not_game_over_kids = []
+            for child in selected_node_stack[-1].children:
+                if not child.gg:
+                    not_game_over_kids.append(child)
+            if len(not_game_over_kids) == 0:
+                del selected_node_stack[-1]
+            else:
+                random_selection = random.choice(not_game_over_kids)
+                selected_node_stack.append(random_selection)
+        return selected_node_stack[-1]
         '''
+
+    def select_random_weighted_move(self, fen):
+        board = PxBoard(fen)
+        legal_moves = list(board.legal_moves)
+        if len(legal_moves) == 0:
+            return None, board
+        legal_values = []
+        for i in range(len(legal_moves)):
+            board_copy = board.copy()
+            board_copy.push(legal_moves[i])
+            value = self.evaluate_board_v2(board_copy)
+            if self.color != board.turn:
+                value = -value
+            legal_values.append(value)
+        legal_values = softmax(legal_values)
+        chosen_move = random.choices(legal_moves, weights=legal_values)[0]
         board.push(chosen_move)
-        #print(board.fen())
-        child = TreeNode(position=board.fen(), move=chosen_move, parents=[node])
-        #print("?????")
-        #print(node.position)
-        #print(child.position)
+        return chosen_move, board
+        
+    def expand(self, node):
+        chosen_move, board_copy = self.select_random_weighted_move(node.position)
+        child = TreeNode(position=board_copy.fen(), move=chosen_move, parents=[node])
+        if board_copy.is_game_over():
+            child.gg = True
         self.node_dict[child.position] = child
         node.children.append(child)
         return child
 
     def play_game(self, node):
         board = PxBoard(node.position)
-        while not board.is_game_over(claim_draw=True):
-            chosen_move = random.choice(list(board.legal_moves))
+        #print() 
+        #print("SIMULATED GAME")
+        move_count = 0
+        while move_count < 10 and not board.is_game_over(claim_draw=True):
+            chosen_move, _ = self.select_random_weighted_move(board.fen())
             board.push(chosen_move)
-        result = board.better_result()
-        if result == self.color:
-            return 1
-        elif result is None:
-            return 0.5
+            move_count += 1
+            #print(chosen_move.uci())
+        if board.is_game_over(claim_draw=True):
+            result = board.better_result()
+            if result == self.color:
+                result = 1
+            elif result is None:
+                result = 0.5
+            else:
+                result = 0
         else:
-            return 0
+            result = self.evaluate_board(board)
+            result = 1.0 / (1 + math.exp(-result))
+        #print(len(board.move_stack))
+        print("RESULT:\t" + str(result))
+        #print()
+        return result
 
     def __init__(self):
         super().__init__()
@@ -281,6 +316,17 @@ class DumbMctsAgent(AbstractMctsAgent):
             chess.QUEEN: [0 for _ in range(64)],
             chess.ROOK: [0 for _ in range(64)]}
 
+    def evaluate_board_v2(self, board=None):
+        if board is None:
+            board = self.board
+        min_value = float("inf")
+        for move in board.legal_moves:
+            board_copy = board.copy()
+            board_copy.push(move)
+            value = self.evaluate_board(board_copy)
+            if value < min_value:
+                min_value = value
+        return min_value
 
     def evaluate_board(self, board=None, printing=False):
         if board is None:
@@ -334,6 +380,7 @@ class DumbMctsAgent(AbstractMctsAgent):
         #    print(pure_material_value)
         #    print(square_adjustments)
         return material_value #+ 0.1 * random.random()
+
 
 
 class AbstractAlphaBetaAgent(Agent):
