@@ -104,8 +104,8 @@ class TreeNode:
         self.move = move
         self.parents = parents
         self.children = []
-        self.numerator = 0.0
-        self.denominator = 0.0
+        self.numerator = 0.5
+        self.denominator =  1.0
         self.flag = 0.0
         self.gg = False
 
@@ -142,20 +142,20 @@ class AbstractMctsAgent(Agent):
             # 1. select node to expand
             current_time = time.time()
             selected_node = self.select_node(root)
-            print("\t" + str(time.time() - current_time))
+            print("1\t" + str(time.time() - current_time))
             current_time = time.time()
             # 2. look at children of selected node and choose one
             expanding_child = self.expand(selected_node)
-            print("\t" + str(time.time() - current_time))
+            print("2\t" + str(time.time() - current_time))
             current_time = time.time()
             if expanding_child:
                 # 3. play a full random game from selected node
                 result = self.play_game(expanding_child)
-                print("\t" + str(time.time() - current_time))
+                print("3\t" + str(time.time() - current_time))
                 current_time = time.time()
                 # 4. backprop result
                 self.backprop(expanding_child, result)
-                print("\t" + str(time.time() - current_time))
+                print("4\t" + str(time.time() - current_time))
                 current_time = time.time()
         
         best_child = max(root.children, key=lambda x: x.payout())
@@ -226,7 +226,7 @@ class DumbMctsAgent(AbstractMctsAgent):
         for i in range(len(legal_moves)):
             board_copy = board.copy()
             board_copy.push(legal_moves[i])
-            value = self.evaluate_board_v2(board_copy)
+            value = self.evaluate_board(board_copy)
             if self.color != board.turn:
                 value = -value
             legal_values.append(value)
@@ -236,12 +236,19 @@ class DumbMctsAgent(AbstractMctsAgent):
         return chosen_move, board
         
     def expand(self, node):
-        chosen_move, board_copy = self.select_random_weighted_move(node.position)
+        board = PxBoard(node.position)
+        legal_moves = list(board.legal_moves)
+        for move in board.legal_moves:
+            board_copy = board.copy()
+            board_copy.push(move)
+            child = TreeNode(position=board_copy.fen(), move=move, parents=[node])
+            if board_copy.is_game_over():
+                child.gg = True
+            self.node_dict[child.position] = child
+            node.children.append(child)
+        _, board_copy = self.select_random_weighted_move(node.position)
+        return self.node_dict[board_copy.fen()]
         child = TreeNode(position=board_copy.fen(), move=chosen_move, parents=[node])
-        if board_copy.is_game_over():
-            child.gg = True
-        self.node_dict[child.position] = child
-        node.children.append(child)
         return child
 
     def play_game(self, node):
@@ -263,7 +270,7 @@ class DumbMctsAgent(AbstractMctsAgent):
             else:
                 result = 0
         else:
-            result = self.evaluate_board(board)
+            result = self.evaluate_board(board) ** 2
             result = 1.0 / (1 + math.exp(-result))
         #print(len(board.move_stack))
         print("RESULT:\t" + str(result))
