@@ -56,9 +56,9 @@ class Net(nn.Module):
 # build network, loss function, optimizer
 net = Net()
 loss_fn = nn.CrossEntropyLoss()
-optimizer = optim.SGD(
-    net.parameters(), lr=0.001, momentum=0.9)
-
+#optimizer = optim.SGD(
+    #net.parameters(), lr=0.001, momentum=0.9)
+optimizer = optim.Adam(net.parameters(), lr=1e-3, eps=1e-4)
 # build (random) dataset
 #random_input = torch.randn(8, 1, 32, 32)
 #random_target = torch.rand(8, 10)
