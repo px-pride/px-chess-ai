@@ -105,7 +105,7 @@ class RandomCpuAgent(Agent):
 
     def get_move(self):
         legal_moves = list(self.board.legal_moves)
-        return random.choice(legal_moves).uci()
+        return random.choice(legal_moves)#.uci()
 
 
 class RandomTttAgent(Agent):
@@ -148,6 +148,29 @@ class DNN(nn.Module):
         return x
 
 
+class ActorCriticDNN(DNN):
+    def __init__(self, num_in, num_out, num_hidden_layers, num_nodes_per_hidden_layer, act_fn=F.relu):
+        super(ActorCriticDNN, self).__init__(num_in, num_out, num_hidden_layers, num_nodes_per_hidden_layer, act_fn)
+        if self.num_hidden_layers == 0:
+            self.critic_out = nn.Linear(self.num_in, self.num_out)
+        else:
+            self.critic_out = nn.Linear(self.num_nodes_per_hidden_layer, self.num_out)
+
+    def forward(self, x):
+        if self.num_hidden_layers == 0:
+            actor = self.fc(x)
+            critic = self.critic_out(x)
+        else:
+            x = self.fc_in(x)
+            x = self.act_fn(x)
+            for i in range(self.num_hidden_layers - 1):
+                x = self.fc_hidden[i](x)
+                x = self.act_fn(x)
+            actor = self.fc_out(x)
+            critic = F.tanh(self.critic_out(x))
+        return (actor, critic)
+
+
 class NeuralTttAgent(Agent):
     def __init__(self, nn=None):
         super().__init__()
@@ -161,17 +184,22 @@ class NeuralTttAgent(Agent):
         if board is None:
             board = self.board
         nn_in = np.zeros(18, dtype=np.float32)
+        #print(self.color)
         for i in range(3):
             for j in range(3):
-                if board[i][j] == 'X':
+                if board[i][j] == 'X': #(board[i][j] == 'X' and self.color == chess.WHITE) or (board[i][j] == 'O' and self.color == chess.BLACK):
                     nn_in[2*(3*i + j)] = 1.0
-                elif board[i][j] == 'O':
+                elif board[i][j] == 'O': #(board[i][j] == 'O' and self.color == chess.WHITE) or (board[i][j] == 'X' and self.color == chess.BLACK):
                     nn_in[2*(3*i + j) + 1] = 1.0
         return torch.from_numpy(nn_in)
 
     def get_move(self, return_score=False):
         nn_in = self.parse_board()
-        nn_out = self.nn(nn_in)
+        raw_nn_out = self.nn(nn_in)
+        if isinstance(raw_nn_out, tuple):
+            nn_out = raw_nn_out[0]
+        else:
+            nn_out = raw_nn_out
         nn_out_tuples = [(i, nn_out[i]) for i in range(9)]
         legal_moves = list(self.board.legal_moves)
         if self.best_move_always:
@@ -182,7 +210,11 @@ class NeuralTttAgent(Agent):
                 move = board.move_from_coords(i, j)
                 if move in legal_moves:
                     if return_score:
-                        return move, score_tuple[1]
+                        if isinstance(raw_nn_out, tuple):
+                            critic_score = raw_nn_out[1][score_tuple[0]]
+                            return move, score_tuple[1], critic_score
+                        else:
+                            return move, score_tuple[1]
                     return move
             raise ValueError("no legal moves ???")
         else:
@@ -199,8 +231,158 @@ class NeuralTttAgent(Agent):
             smax = torch.softmax(nn_out, -1)
             chosen_move = random.choices(moves, weights=smax)[0]
             if return_score:
-                return chosen_move[1], smax[chosen_move[0]]
+                if isinstance(raw_nn_out, tuple):
+                    critic_score = raw_nn_out[1][chosen_move[0]]
+                    fake_nn_out = [x for x in nn_out]
+                    for i in range(len(fake_nn_out)):
+                        if fake_nn_out[i] == float("-inf"):
+                            fake_nn_out[i] = float("inf")
+                    if min(fake_nn_out) < -1e20:
+                        print(fake_nn_out)
+                    return chosen_move[1], smax[chosen_move[0]], critic_score
+                else:
+                    return chosen_move[1], smax[chosen_move[0]]
             return chosen_move[1]
+
+
+class ActorCriticTttAgent(NeuralTttAgent):
+    def __init__(self, nn=None):
+        if nn is not None:
+            self.nn = nn
+        else:
+            self.nn = ActorCriticDNN(18, 9, 1, 64, act_fn=F.relu)
+        self.best_move_always = False
+
+
+class NeuralChessAgent(Agent):
+    def __init__(self, nn=None):
+        super().__init__()
+        if nn is not None:
+            self.nn = nn
+        else:
+            self.nn = DNN(64*8, 64*(56+8*4), 1, 64, act_fn=F.relu)
+        self.best_move_always = False
+
+    def parse_board(self, board=None):
+        if board is None:
+            board = self.board
+        nn_in = np.zeros((8,8,8), dtype=np.float32) # row x column x state_info
+        # needs castling rights etc
+        piece_map = board.piece_map()
+        for square in piece_map:
+            row = square // 8
+            col = square % 8
+            piece_color = piece_map[square].color
+            if piece_color == chess.WHITE:
+                nn_in[row, col, 0] = 1.0
+            else:
+                nn_in[row, col, 1] = 1.0
+            piece_type = piece_map[square].piece_type
+            nn_in[row, col, piece_type + 1] = 1.0
+        nn_in = nn_in.flatten()
+        return torch.from_numpy(nn_in)
+
+    def idx2move(self, idx):
+        # start_pos
+        # end_pos
+        # promotion
+        start_pos_idx = idx // (56+8*4)
+        start_col = start_pos_idx % 8 + 1
+        #print(start_pos_idx)
+        start_row = start_pos_idx // 8
+        #print(start_row)
+        start_row = chr(ord('a') + start_row)
+        #print(start_row)
+        start_col = str(start_col)
+        end_pos_idx = idx % 73
+        promotion = ''
+        if end_pos_idx < 64:
+            end_col = end_pos_idx % 8 + 1
+            end_row = end_pos_idx // 8
+            end_row = chr(ord('a') + end_row)
+            end_col = str(end_col)
+        elif end_pos_idx >= 64:
+            end_col = end_pos_idx % 8 + 1
+            end_row = 7
+            end_row = chr(ord('a') + end_row)
+            end_col = str(end_col)
+            promotion = (end_pos_idx - 64) // 8
+            if promotion == 0:
+                promotion = 'r'
+            elif promotion == 1:
+                promotion = 'n'
+            elif promotion == 2:
+                promotion = 'b'
+        move_name = start_row + start_col + end_row + end_col + promotion
+        #print(move_name)
+        return move_name
+
+    def get_move(self, return_score=False):
+        #print("test1")
+        nn_in = self.parse_board()
+        raw_nn_out = self.nn(nn_in)
+        if isinstance(raw_nn_out, tuple):
+            nn_out = raw_nn_out[0]
+        else:
+            nn_out = raw_nn_out
+        nn_out_tuples = [(i, nn_out[i]) for i in range(9)]
+        legal_moves = [move.uci() for move in self.board.legal_moves]
+        #print("test2")
+        if self.best_move_always:
+            #print("test3")
+            sorted_outputs = sorted(nn_out_tuples, key = lambda x: -x[1])
+            for score_tuple in sorted_outputs:
+                move = self.idx2move(score_tuple[0])
+                if move in legal_moves:
+                    #print(move)
+                    #print(nn_out_tuples)
+                    if return_score:
+                        if isinstance(raw_nn_out, tuple):
+                            critic_score = raw_nn_out[1][score_tuple[0]]
+                            return move, score_tuple[1], critic_score
+                        else:
+                            return move, score_tuple[1]
+                    return move
+            raise ValueError("no legal moves ???")
+        else:
+            #print("test4")
+            mask = np.zeros(64*(56+8*4))
+            moves = []
+            for k in range(64*(56+8*4)):
+                move = self.idx2move(k)
+                moves.append((k, move))
+                if move not in legal_moves:
+                    mask[k] = float("-inf")
+            nn_out += torch.from_numpy(mask)#, requires_grad=False)
+            smax = torch.softmax(nn_out, -1)
+            chosen_move = random.choices(moves, weights=smax)[0]
+            if return_score:
+                if isinstance(raw_nn_out, tuple):
+                    critic_score = raw_nn_out[1][chosen_move[0]]
+                    fake_nn_out = [x for x in nn_out]
+                    for i in range(len(fake_nn_out)):
+                        if fake_nn_out[i] == float("-inf"):
+                            fake_nn_out[i] = float("inf")
+                    #if min(fake_nn_out) < -1e20:
+                        #print(fake_nn_out)
+                    #print(moves)
+                    #print(nn_out)
+                    return chosen_move[1], smax[chosen_move[0]], critic_score
+                else:
+                    return chosen_move[1], smax[chosen_move[0]]
+            #print(moves)
+            #print(smax)
+            #print(legal_moves)
+            return chosen_move[1]
+
+
+class ActorCriticChessAgent(NeuralChessAgent):
+    def __init__(self, nn=None):
+        if nn is not None:
+            self.nn = nn
+        else:
+            self.nn = ActorCriticDNN(64*8, 64*(56+8*4), 1, 64, act_fn=F.relu)
+        self.best_move_always = False
 
 
 class TreeNode:
@@ -755,26 +937,25 @@ class DumbGreedyCpuAgent(AbstractAlphaBetaAgent):
 # CVC Training
 
 # start game with two players (human or cpu)
-players = [NeuralTttAgent()]
-players.append(NeuralTttAgent(nn=players[0].nn))
+players = [ActorCriticChessAgent()]
+players.append(ActorCriticChessAgent(nn=players[0].nn))
 
 # choose colors for each player
 #random.shuffle(players)
 print(players)
 
 # core game loop
-board = TttBoard()
+board = PxBoard()
 
 net = players[0].nn
 #net.load_state_dict(torch.load("ttt_model"))
 #optimizer = optim.Adam(net.parameters(), lr=1e-2, eps=1e-2)
-optimizer = optim.SGD(net.parameters(), lr=1e-2)
-num_training_iterations = 16000
-batch_size = 16
-loss_fns = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+optimizer = optim.SGD(net.parameters(), lr=1e-4)
+num_training_iterations = 50000
+batch_size = 1
 
 pre_train_score = [0,0,0]
-for k in range(100):
+for k in range(0):
     players[0].start_game(board, chess.WHITE)
     players[1].start_game(board, chess.BLACK)
     board.reset()
@@ -783,7 +964,7 @@ for k in range(100):
             current_player = players[0]
         else:
             current_player = players[1]
-        move_uci, prob = current_player.get_move(return_score=True)
+        move_uci = current_player.get_move()#return_score=False)
         board.push_uci(move_uci)
     result = board.result()
     if result == "1-0":
@@ -794,41 +975,76 @@ for k in range(100):
         pre_train_score[2] += 1
 print(pre_train_score)
 
+
+
+# state_0 is input to white's NN
+# state_1 is result of white's action
+# state_1 is input to black's NN
+# state_2 is result of black's action
+# state_2 is input to white's NN
+
+
+actor_loss_fns = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+critic_loss_fns = {chess.WHITE: 0.0, chess.BLACK: 0.0}
 optimizer.zero_grad()
 for k in range(num_training_iterations):
     players[0].start_game(board, chess.WHITE)
     players[1].start_game(board, chess.BLACK)
     board.reset()
-    log_probs = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+    log_probs = {chess.WHITE: [], chess.BLACK: []}
+    q_values = {chess.WHITE: [], chess.BLACK: []}
     while not board.is_game_over(claim_draw=True):
         if board.turn == chess.WHITE:
             current_player = players[0]
         else:
             current_player = players[1]
-        move_uci, prob = current_player.get_move(return_score=True)
-        log_probs[board.turn] += torch.log(prob)
+        if board.turn == chess.WHITE:
+            move_uci = current_player.get_move()#return_score=False)
+        else:
+            move_uci, prob, critic_score = current_player.get_move(return_score=True)
+            log_probs[board.turn].append(torch.log(prob))
+            q_values[board.turn].append(critic_score)
         board.push_uci(move_uci)
+        print(board.fullmove_number)
+        print(board.halfmove_clock)
         #print(move_uci)
         #board.print()
         #print()
     result = board.result()
     if result == "1-0":
         #print("White wins.")
-        rewards = {chess.WHITE: 1.0, chess.BLACK: -1.0}
+        q_values[chess.WHITE].append(torch.tensor(1.0))
+        q_values[chess.BLACK].append(torch.tensor(-1.0))
+        #rewards = {chess.WHITE: 1.0, chess.BLACK: -1.0}
     elif result == "0-1":
         #print("Black wins.")
-        rewards = {chess.WHITE: -1.0, chess.BLACK: 1.0}
+        q_values[chess.WHITE].append(torch.tensor(-1.0))
+        q_values[chess.BLACK].append(torch.tensor(1.0))
+        #rewards = {chess.WHITE: -1.0, chess.BLACK: 1.0}
     else:
         #print("There are no winners in war.")
-        rewards = {chess.WHITE: 0.0, chess.BLACK: 0.0}
-    for player in loss_fns:
-        loss_fns[player] += rewards[player] * (-log_probs[player])
+        q_values[chess.WHITE].append(torch.tensor(0.0))
+        q_values[chess.BLACK].append(torch.tensor(0.0))
+        #rewards = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+    discount = 1.0
+    for player in actor_loss_fns:
+        for t in range(len(log_probs[player])):
+            actor_loss_fns[player] += q_values[player][t].detach() * (-log_probs[player][t]) # stop_grad the q-value
+            delta = discount * q_values[player][t+1].detach() - q_values[player][t] # stop_grad the future q-value
+            critic_loss_fns[player] += delta * delta
     if k % batch_size == batch_size - 1:
-        loss_fn_total = loss_fns[chess.WHITE] + loss_fns[chess.BLACK]
+        #pprint(q_values[chess.WHITE])
+        loss_fn_total = (
+            actor_loss_fns[chess.WHITE] + 
+            actor_loss_fns[chess.BLACK] +
+            critic_loss_fns[chess.WHITE] + 
+            critic_loss_fns[chess.BLACK])
         loss_fn_total.backward(retain_graph=True)
         optimizer.step()
         optimizer.zero_grad()
-        loss_fns = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+        actor_loss_fns = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+        critic_loss_fns = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+        print("training iteration")
 
     if k % 1000 == 999:
         pre_train_score = [0,0,0]
@@ -841,8 +1057,7 @@ for k in range(num_training_iterations):
                     current_player = players[0]
                 else:
                     current_player = players[1]
-                move_uci, prob = current_player.get_move(return_score=True)
-                log_probs[board.turn] += torch.log(prob)
+                move_uci = current_player.get_move()#return_score=False)
                 board.push_uci(move_uci)
             result = board.result()
             if result == "1-0":
@@ -867,7 +1082,7 @@ for k in range(100):
             current_player = players[0]
         else:
             current_player = players[1]
-        move_uci, prob = current_player.get_move(return_score=True)
+        move_uci = current_player.get_move(return_score=False)
         board.push_uci(move_uci)
         if k == 0:
             board.print()
@@ -884,7 +1099,7 @@ print(pre_train_score)
 # PVC SITUATION
 
 # start game with two players (human or cpu)
-players = [NeuralTttAgent(nn=players[0].nn), HumanAgent()]
+players = [players[0], HumanAgent()]
 
 # choose colors for each player
 #random.shuffle(players)
